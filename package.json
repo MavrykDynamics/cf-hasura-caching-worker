@@ -1,0 +1,30 @@
+{
+  "name": "hasura-cache-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for caching Hasura GraphQL API with webhook authentication",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:production": "wrangler deploy --env production",
+    "tail": "wrangler tail",
+    "tail:staging": "wrangler tail --env staging",
+    "tail:production": "wrangler tail --env production"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "hasura",
+    "graphql",
+    "caching",
+    "webhook"
+  ],
+  "author": "tristan.allaire@alarch.fr",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+} 
