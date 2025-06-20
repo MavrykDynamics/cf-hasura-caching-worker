@@ -6,10 +6,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:equiteez": "wrangler deploy --env equiteez",
     "deploy:maven": "wrangler deploy --env maven",
     "tail": "wrangler tail",
-    "tail:staging": "wrangler tail --env staging",
+    "tail:equiteez": "wrangler tail --env equiteez",
     "tail:maven": "wrangler tail --env maven"
   },
   "keywords": [
