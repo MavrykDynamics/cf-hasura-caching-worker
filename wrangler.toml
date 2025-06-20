@@ -1,0 +1,11 @@
+name = "hasura-cache-worker"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Maven environment
+[env.maven]
+name = "hasura-cache-worker-maven"
+
+# Equiteez environment
+[env.equiteez]
+name = "hasura-cache-worker-equiteez"

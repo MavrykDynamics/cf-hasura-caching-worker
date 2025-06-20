@@ -7,10 +7,10 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "deploy:staging": "wrangler deploy --env staging",
-    "deploy:production": "wrangler deploy --env production",
+    "deploy:maven": "wrangler deploy --env maven",
     "tail": "wrangler tail",
     "tail:staging": "wrangler tail --env staging",
-    "tail:production": "wrangler tail --env production"
+    "tail:maven": "wrangler tail --env maven"
   },
   "keywords": [
     "cloudflare-workers",
