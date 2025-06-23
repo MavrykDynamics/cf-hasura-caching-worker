@@ -1,15 +1,96 @@
 # Hasura Cache Worker
 
-A Cloudflare Worker that acts as a caching proxy for Hasura GraphQL API with webhook authentication support.
+A Cloudflare Worker that acts as a caching layer for Hasura GraphQL API with JWT authentication.
 
 ## Features
 
-- ✅ **GraphQL Caching**: Intelligent caching of GraphQL queries with configurable TTL
-- ✅ **Webhook Authentication**: IP-restricted auth webhook for Hasura
-- ✅ **User-Specific Cache**: Separate cache keys for different users/authentication contexts
-- ✅ **Flexible TTL**: Minimum 8-second cache with client-configurable TTL via headers
-- ✅ **Mutation Support**: Mutations bypass cache but are still processed
-- ✅ **Kubernetes Ready**: IP-based security for K8s deployments
+- **JWT Authentication**: Uses JWT tokens with user role for secure access to Hasura
+- **Intelligent Caching**: Caches GraphQL queries with configurable TTL
+- **Client TTL Control**: Clients can specify cache TTL via `X-Cache-TTL` header
+- **Cache Headers**: Returns cache status and age information
+- **Multi-Environment Support**: Deploy to multiple environments with different Hasura endpoints
+
+## Setup
+
+### 1. Configure Hasura for JWT
+
+Set the JWT secret in your Hasura environment:
+```bash
+HASURA_GRAPHQL_JWT_SECRET='{"type":"HS256","key":"your-secret-key-here"}'
+```
+
+### 2. Deploy the Worker
+
+```bash
+# Install dependencies
+npm install
+
+# Deploy to production
+wrangler deploy
+
+# Deploy to specific environment
+wrangler deploy --env maven
+wrangler deploy --env equiteez
+```
+
+### 3. Set Secrets
+
+```bash
+# Set JWT secret (must match Hasura's JWT_SECRET)
+wrangler secret put JWT_SECRET
+
+# Set optional cache TTL
+wrangler secret put CACHE_TTL
+```
+
+## Configuration
+
+### Environment Variables
+
+- `HASURA_ENDPOINT`: Your Hasura GraphQL endpoint
+- `JWT_SECRET`: Secret for signing JWTs (must match Hasura's JWT_SECRET)
+- `CACHE_TTL`: Default cache TTL in seconds (default: 300)
+
+### Client Headers
+
+- `X-Cache-TTL`: Override cache TTL for this request (minimum: 8 seconds)
+- `X-Skip-Cache`: Set to "1" to bypass cache
+
+### Response Headers
+
+- `X-Cache-Status`: "HIT", "MISS", or "SKIP"
+- `X-Cache-Age`: Age of cached response in seconds
+
+## How It Works
+
+1. **JWT Generation**: Worker generates JWT tokens with user role permissions
+2. **Request Forwarding**: Forwards GraphQL requests to Hasura with JWT authentication
+3. **Caching**: Caches responses based on query hash and TTL
+4. **Cache Control**: Respects client-specified TTL with minimum enforcement
+
+## Security
+
+- Uses JWT authentication with user role (not admin)
+- JWT tokens expire after 1 hour
+- No admin access required
+- Secure token signing with HMAC-SHA256
+
+## Multi-Environment Deployment
+
+The worker supports multiple environments with different Hasura endpoints:
+
+```bash
+# Deploy to Maven environment
+wrangler deploy --env maven
+
+# Deploy to Equiteez environment  
+wrangler deploy --env equiteez
+```
+
+Each environment has its own:
+- Worker name
+- Hasura endpoint
+- Secrets (JWT_SECRET, CACHE_TTL)
 
 ## Quick Start
 
