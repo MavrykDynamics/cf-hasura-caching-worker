@@ -107,7 +107,6 @@ async function createCacheKey(request, body) {
     cacheUrl.pathname = `${cacheUrl.pathname}/${ttlContext}/${bodyHash}`
     
     return new Request(cacheUrl.toString(), {
-        headers: request.headers,
         method: "GET",
     })
 }
