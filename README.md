@@ -31,6 +31,7 @@ wrangler deploy
 # Deploy to specific environment
 wrangler deploy --env maven
 wrangler deploy --env equiteez
+wrangler deploy --env dex
 ```
 
 ### 3. Set Secrets
@@ -85,6 +86,9 @@ wrangler deploy --env maven
 
 # Deploy to Equiteez environment  
 wrangler deploy --env equiteez
+
+# Deploy to Dex environment  
+wrangler deploy --env dex
 ```
 
 Each environment has its own:
@@ -111,16 +115,21 @@ Edit `wrangler.toml` to set your Hasura endpoint:
 HASURA_ENDPOINT = "https://your-hasura-api.com/v1/graphql"
 ```
 
-### 3. Set Secrets (Optional)
+### 3. Set Secrets
 
 ```bash
-# For IP restrictions
-wrangler secret put ALLOWED_IPS
-wrangler secret put HASURA_K8S_CLUSTER_IP
+# RSA private key (PKCS#8 PEM) used to sign JWTs for Hasura — required
+wrangler secret put JWT_PRIVATE_KEY < jwt-private-pkcs8.pem
 
-# For custom default TTL
+# Pre-shared secret the calling backend must send in X-Worker-Secret — required
+wrangler secret put WORKER_SHARED_SECRET
+
+# Default cache TTL in seconds — optional
 wrangler secret put CACHE_TTL
 ```
+
+> The worker **fails closed**: if `WORKER_SHARED_SECRET` is not set, every
+> request is rejected with `401`.
 
 ### 4. Deploy
 
@@ -139,16 +148,27 @@ npm run deploy:production
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HASURA_ENDPOINT` | Your Hasura GraphQL endpoint | Required |
-| `ALLOWED_IPS` | Comma-separated list of allowed IPs | None (allow all) |
-| `HASURA_K8S_CLUSTER_IP` | K8s cluster IP range (e.g., "10.0.0.0/8") | None |
+| `JWT_PRIVATE_KEY` | RSA private key (PKCS#8 PEM) used to sign JWTs (RS256) | Required |
+| `WORKER_SHARED_SECRET` | Pre-shared secret callers send in `X-Worker-Secret` | Required (fails closed) |
 | `CACHE_TTL` | Default cache TTL in seconds | 300 (5 minutes) |
 
 ### Hasura Configuration
 
-Set your Hasura environment variable:
+Configure Hasura to verify the worker's RS256 JWTs using the matching **public** key:
 
 ```bash
-HASURA_GRAPHQL_AUTH_HOOK=https://your-worker.workers.dev/auth
+HASURA_GRAPHQL_JWT_SECRET='{"type":"RS256","key":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"}'
+```
+
+### Calling the worker
+
+The backend must include the shared secret on every request:
+
+```bash
+curl https://your-worker.example.com/v1/graphql \
+  -H "Content-Type: application/json" \
+  -H "X-Worker-Secret: <WORKER_SHARED_SECRET>" \
+  -d '{"query":"{ your_query }"}'
 ```
 
 ## Usage
@@ -294,24 +314,6 @@ This ensures:
 - Mutations don't interfere with query cache
 
 ## Security
-
-### IP Restrictions
-
-For Kubernetes deployments, configure IP restrictions:
-
-```bash
-# Set K8s cluster IP range
-wrangler secret put HASURA_K8S_CLUSTER_IP
-# Value: 10.0.0.0/8
-
-# Or set specific allowed IPs
-wrangler secret put ALLOWED_IPS  
-# Value: 10.244.1.5,10.244.2.10
-```
-
-### Development Mode
-
-If no IP restrictions are configured, all IPs are allowed (development mode).
 
 ## Troubleshooting
 

@@ -1,10 +1,30 @@
 // Configuration - these should be set as environment variables in Cloudflare Worker
 const HASURA_ENDPOINT = globalThis.HASURA_ENDPOINT
-const ALLOWED_IPS = globalThis.ALLOWED_IPS // Comma-separated list of allowed IPs/CIDR blocks for webhook calls
-const HASURA_K8S_CLUSTER_IP = globalThis.HASURA_K8S_CLUSTER_IP // IP range of your K8s cluster (e.g., "10.0.0.0/8")
 const CACHE_TTL = globalThis.CACHE_TTL || 300 // Cache TTL in seconds (default: 5 minutes)
 const MIN_CACHE_TTL = 8; // Minimum cache TTL in seconds
-const JWT_SECRET = globalThis.JWT_SECRET // Secret for signing JWTs (same as Hasura's JWT_SECRET)
+const JWT_PRIVATE_KEY = globalThis.JWT_PRIVATE_KEY // PEM-encoded RSA private key (PKCS#8) for signing JWTs; Hasura verifies with the matching public key
+const WORKER_SHARED_SECRET = globalThis.WORKER_SHARED_SECRET // Pre-shared secret the calling backend must send in the X-Worker-Secret header
+
+// Constant-time string comparison to avoid leaking the secret via timing
+function timingSafeEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false
+    const aBytes = new TextEncoder().encode(a)
+    const bBytes = new TextEncoder().encode(b)
+    // Compare lengths in constant time by folding into the accumulator
+    let mismatch = aBytes.length ^ bBytes.length
+    const len = Math.max(aBytes.length, bBytes.length)
+    for (let i = 0; i < len; i++) {
+        mismatch |= (aBytes[i] || 0) ^ (bBytes[i] || 0)
+    }
+    return mismatch === 0
+}
+
+// Verify the inbound request carries the correct pre-shared secret.
+// Fails closed: if no secret is configured, all requests are rejected.
+function isAuthorized(request) {
+    if (!WORKER_SHARED_SECRET) return false
+    return timingSafeEqual(request.headers.get('X-Worker-Secret') || '', WORKER_SHARED_SECRET)
+}
 
 async function sha256(message) {
     // encode as UTF-8
@@ -21,23 +41,71 @@ async function sha256(message) {
     return hashHex
 }
   
+// Strip GraphQL string literals and comments so keyword detection can't be
+// fooled by the word "mutation" appearing inside a string value or a comment.
+function stripStringsAndComments(query) {
+    return query
+        .replace(/"""[\s\S]*?"""/g, '')   // block strings
+        .replace(/"(?:\\.|[^"\\])*"/g, '') // double-quoted strings
+        .replace(/#[^\n\r]*/g, '')         // line comments
+}
+
+// True if a single GraphQL document contains a mutation operation.
+// A mutation always requires the `mutation` keyword (anonymous `{...}` is a
+// query), so detecting that keyword at a definition boundary is sufficient.
+function documentHasMutation(query) {
+    if (typeof query !== 'string') return false
+    const cleaned = stripStringsAndComments(query)
+    // `mutation` keyword followed by a name, variable list `(`, or selection `{`
+    return /\bmutation\b\s*[A-Za-z_({]/.test(cleaned)
+}
+
+// Determine whether a request should be blocked as a mutation.
+// Handles batched (array) request bodies and fails open to "is a mutation"
+// only when we can positively identify one — unparseable bodies are treated
+// as non-mutations and forwarded (they will fail at Hasura if invalid).
 async function blockMutation(req) {
     try {
         const body = await req.clone().json()
-        console.log(body.query.replace(/\s/g, '').indexOf("mutation"))
-        return body.query.replace(/\s/g, '').indexOf("mutation") == 0
+        const ops = Array.isArray(body) ? body : [body]
+        return ops.some(op => op && documentHasMutation(op.query))
     } catch (e) {
         return false
     }
 }
 
-// Generate JWT for Hasura authentication
+function pemToArrayBuffer(pem) {
+    const b64 = pem
+        .replace(/-----BEGIN [^-]+-----/, '')
+        .replace(/-----END [^-]+-----/, '')
+        .replace(/\s+/g, '')
+    const binary = atob(b64)
+    const buf = new ArrayBuffer(binary.length)
+    const view = new Uint8Array(buf)
+    for (let i = 0; i < binary.length; i++) view[i] = binary.charCodeAt(i)
+    return buf
+}
+
+let cachedSigningKey = null
+async function getSigningKey() {
+    if (cachedSigningKey) return cachedSigningKey
+    cachedSigningKey = await crypto.subtle.importKey(
+        'pkcs8',
+        pemToArrayBuffer(JWT_PRIVATE_KEY),
+        { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+        false,
+        ['sign']
+    )
+    return cachedSigningKey
+}
+
+// Generate JWT for Hasura authentication (RS256)
 async function generateJWT() {
     const header = {
-        alg: 'HS256',
+        alg: 'RS256',
         typ: 'JWT'
     }
-    
+
     const payload = {
         sub: 'worker-user',
         iat: Math.floor(Date.now() / 1000),
@@ -48,46 +116,40 @@ async function generateJWT() {
             'x-hasura-user-id': 'worker-user'
         }
     }
-    
-    // Encode header and payload
+
     const encodedHeader = btoa(JSON.stringify(header)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
     const encodedPayload = btoa(JSON.stringify(payload)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
-    
-    // Create signature
+
     const data = encodedHeader + '.' + encodedPayload
-    const encoder = new TextEncoder()
-    const keyData = encoder.encode(JWT_SECRET)
-    const key = await crypto.subtle.importKey('raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-    const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(data))
-    
-    // Encode signature
+    const key = await getSigningKey()
+    const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(data))
+
     const signatureArray = new Uint8Array(signature)
     const encodedSignature = btoa(String.fromCharCode(...signatureArray)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
-    
+
     return data + '.' + encodedSignature
 }
 
 async function createHasuraRequest(originalRequest, body) {
-    // Create headers for Hasura request
-    const headers = new Headers(originalRequest.headers)
-    
-    // Ensure content-type is set for GraphQL
+    // Build a clean header set instead of forwarding arbitrary client headers.
+    // This prevents callers from smuggling headers to Hasura (e.g. x-hasura-*
+    // session variables or an admin secret). We add only what Hasura needs.
+    const headers = new Headers()
     headers.set('Content-Type', 'application/json')
-    
-    // Remove headers that shouldn't be forwarded
-    headers.delete('host')
-    headers.delete('cf-ray')
-    headers.delete('cf-connecting-ip')
-    headers.delete('cf-visitor')
-    headers.delete('x-forwarded-proto')
-    headers.delete('x-real-ip')
-    
-    // Add JWT authentication
-    if (JWT_SECRET) {
+
+    // Preserve CORS preflight context so Hasura can answer OPTIONS correctly
+    const corsHeaders = ['origin', 'access-control-request-method', 'access-control-request-headers']
+    for (const name of corsHeaders) {
+        const value = originalRequest.headers.get(name)
+        if (value) headers.set(name, value)
+    }
+
+    // Add JWT authentication (overrides any client-supplied Authorization)
+    if (JWT_PRIVATE_KEY) {
         const jwt = await generateJWT()
         headers.set('Authorization', `Bearer ${jwt}`)
     }
-    
+
     return new Request(HASURA_ENDPOINT, {
         method: originalRequest.method,
         headers: headers,
@@ -123,7 +185,11 @@ async function handlePostRequest(event) {
     
     // Hash the request body to use it as a part of the cache key
     if (!isMutation) {
-        // Create cache key that includes user authentication context
+        // Cache key = query body + requested TTL. The cache is global: every
+        // request reaches Hasura as the same fixed worker identity, so all
+        // callers share one cache. If per-caller identity passthrough is ever
+        // added, the identity MUST be folded into this key to avoid leaking
+        // one caller's data to another.
         const cacheKey = await createCacheKey(request, body)
 
         const cache = caches.default
@@ -213,24 +279,46 @@ async function handleOptionsRequest(request) {
     return newResponse
 }
 
+function unauthorizedResponse() {
+    return new Response(JSON.stringify({
+        errors: [{
+            message: "Unauthorized.",
+            extensions: { code: "UNAUTHORIZED" }
+        }]
+    }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+    })
+}
+
 addEventListener("fetch", event => {
     try {
         const request = event.request
         const url = new URL(request.url)
-        
+
+        // Gate every request on the pre-shared secret (fails closed)
+        if (!isAuthorized(request)) {
+            return event.respondWith(unauthorizedResponse())
+        }
+
         // Handle GraphQL requests with caching
         if (url.pathname === '/v1/graphql' && request.method.toUpperCase() === "POST") { //&& request.headers.get('X-Skip-Cache') != '1') {
             return event.respondWith(handlePostRequest(event))
         }
-        
+
         // Forward OPTIONS requests directly to Hasura (CORS preflight)
         if (request.method.toUpperCase() === "OPTIONS") {
             return event.respondWith(handleOptionsRequest(request))
         }
-        
+
         return event.respondWith(handleNonCachedRequest(request))
     } catch (e) {
         console.log(e.message)
-        return event.respondWith(new Response("Error thrown " + e.message))
+        return event.respondWith(new Response(JSON.stringify({
+            errors: [{ message: "Internal error.", extensions: { code: "INTERNAL_ERROR" } }]
+        }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        }))
     }
 })
