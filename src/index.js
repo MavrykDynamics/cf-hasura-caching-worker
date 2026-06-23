@@ -3,14 +3,18 @@ const HASURA_ENDPOINT = globalThis.HASURA_ENDPOINT
 const CACHE_TTL = globalThis.CACHE_TTL || 300 // Cache TTL in seconds (default: 5 minutes)
 const MIN_CACHE_TTL = 8; // Minimum cache TTL in seconds
 const JWT_PRIVATE_KEY = globalThis.JWT_PRIVATE_KEY // PEM-encoded RSA private key (PKCS#8) for signing JWTs; Hasura verifies with the matching public key
-const WORKER_SHARED_SECRET = globalThis.WORKER_SHARED_SECRET // Pre-shared secret the calling backend must send in the X-Worker-Secret header
+const HASURA_ROLE = globalThis.HASURA_ROLE || 'anonymous' // Hasura role the worker assumes; lock this role down to public data only
+// Optional local-testing escape hatch: when set, a request carrying this secret
+// (via the X-Allowlist-Bypass header OR a ?bypass= query param) gets its Origin
+// reflected even if not on the allowlist. Leave UNSET on the deployed equiteez
+// env. Since the data is public, this only relaxes the browser CORS check.
+const ALLOWLIST_BYPASS_SECRET = globalThis.ALLOWLIST_BYPASS_SECRET
 
 // Constant-time string comparison to avoid leaking the secret via timing
 function timingSafeEqual(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false
     const aBytes = new TextEncoder().encode(a)
     const bBytes = new TextEncoder().encode(b)
-    // Compare lengths in constant time by folding into the accumulator
     let mismatch = aBytes.length ^ bBytes.length
     const len = Math.max(aBytes.length, bBytes.length)
     for (let i = 0; i < len; i++) {
@@ -19,11 +23,57 @@ function timingSafeEqual(a, b) {
     return mismatch === 0
 }
 
-// Verify the inbound request carries the correct pre-shared secret.
-// Fails closed: if no secret is configured, all requests are rejected.
-function isAuthorized(request) {
-    if (!WORKER_SHARED_SECRET) return false
-    return timingSafeEqual(request.headers.get('X-Worker-Secret') || '', WORKER_SHARED_SECRET)
+// True if the request presents the correct allowlist-bypass secret (header or
+// ?bypass= query param). The query param is supported because a browser CORS
+// preflight cannot carry a custom header but does include the URL's query.
+function originBypassed(request) {
+    if (!ALLOWLIST_BYPASS_SECRET || !request) return false
+    let provided = request.headers.get('X-Allowlist-Bypass') || ''
+    if (!provided) {
+        try { provided = new URL(request.url).searchParams.get('bypass') || '' } catch (e) { provided = '' }
+    }
+    return timingSafeEqual(provided, ALLOWLIST_BYPASS_SECRET)
+}
+
+// Origins allowed to call the worker. Override via the ALLOWED_ORIGINS env var
+// (comma-separated); otherwise this default list applies. Values are normalized
+// to scheme+host (no trailing slash/path) because that is exactly how a browser
+// formats the Origin header.
+const ALLOWED_ORIGINS = (globalThis.ALLOWED_ORIGINS
+    ? globalThis.ALLOWED_ORIGINS.split(',')
+    : []).map(o => o.trim().replace(/\/+$/, '')).filter(Boolean)
+
+// The worker is browser-facing and serves PUBLIC data, so callers are not
+// authenticated. Abuse is controlled by: edge rate limiting (Cloudflare),
+// mutation blocking, and a locked-down Hasura role (see generateJWT) — NOT by
+// a caller secret, which would be readable in any browser bundle.
+//
+// Note: CORS only constrains browsers. The allowlist controls which sites' JS
+// may READ responses; it is not a server-side access control (a non-browser
+// client can omit/forge Origin). That is acceptable here because the data is
+// public.
+function corsHeaders(request) {
+    const origin = (request && request.headers.get('Origin')) || ''
+    const headers = {
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Cache-TTL',
+        'Access-Control-Expose-Headers': 'X-Cache-Status, X-Cache-Age, X-Cache-TTL',
+        'Access-Control-Max-Age': '86400',
+        'Vary': 'Origin'
+    }
+    // Reflect the caller's origin if it is on the allowlist, or if the request
+    // carries the local-testing bypass secret.
+    if (origin && (ALLOWED_ORIGINS.includes(origin) || originBypassed(request))) {
+        headers['Access-Control-Allow-Origin'] = origin
+    }
+    return headers
+}
+
+// Apply CORS headers to a response destined for the browser.
+function withCors(response, request) {
+    const newResponse = new Response(response.body, response)
+    for (const [k, v] of Object.entries(corsHeaders(request))) newResponse.headers.set(k, v)
+    return newResponse
 }
 
 async function sha256(message) {
@@ -111,9 +161,8 @@ async function generateJWT() {
         iat: Math.floor(Date.now() / 1000),
         exp: Math.floor(Date.now() / 1000) + 3600, // 1 hour expiry
         'https://hasura.io/jwt/claims': {
-            'x-hasura-default-role': 'user',
-            'x-hasura-allowed-roles': ['user'],
-            'x-hasura-user-id': 'worker-user'
+            'x-hasura-default-role': HASURA_ROLE,
+            'x-hasura-allowed-roles': [HASURA_ROLE]
         }
     }
 
@@ -136,13 +185,6 @@ async function createHasuraRequest(originalRequest, body) {
     // session variables or an admin secret). We add only what Hasura needs.
     const headers = new Headers()
     headers.set('Content-Type', 'application/json')
-
-    // Preserve CORS preflight context so Hasura can answer OPTIONS correctly
-    const corsHeaders = ['origin', 'access-control-request-method', 'access-control-request-headers']
-    for (const name of corsHeaders) {
-        const value = originalRequest.headers.get(name)
-        if (value) headers.set(name, value)
-    }
 
     // Add JWT authentication (overrides any client-supplied Authorization)
     if (JWT_PRIVATE_KEY) {
@@ -270,24 +312,11 @@ async function handleNonCachedRequest(request) {
     return new Response('Not Found', { status: 404 })
 }
 
-async function handleOptionsRequest(request) {
-    // Forward OPTIONS requests directly to Hasura (CORS preflight)
-    const hasuraRequest = await createHasuraRequest(request, '')
-    const response = await fetch(hasuraRequest)
-    const newResponse = new Response(response.body, response)
-    newResponse.headers.append('X-Cache-Status', 'OPTIONS')
-    return newResponse
-}
-
-function unauthorizedResponse() {
-    return new Response(JSON.stringify({
-        errors: [{
-            message: "Unauthorized.",
-            extensions: { code: "UNAUTHORIZED" }
-        }]
-    }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' }
+function handleOptionsRequest(request) {
+    // Answer CORS preflight at the edge — no need to round-trip to Hasura
+    return new Response(null, {
+        status: 204,
+        headers: corsHeaders(request)
     })
 }
 
@@ -296,22 +325,17 @@ addEventListener("fetch", event => {
         const request = event.request
         const url = new URL(request.url)
 
-        // Gate every request on the pre-shared secret (fails closed)
-        if (!isAuthorized(request)) {
-            return event.respondWith(unauthorizedResponse())
-        }
-
-        // Handle GraphQL requests with caching
-        if (url.pathname === '/v1/graphql' && request.method.toUpperCase() === "POST") { //&& request.headers.get('X-Skip-Cache') != '1') {
-            return event.respondWith(handlePostRequest(event))
-        }
-
-        // Forward OPTIONS requests directly to Hasura (CORS preflight)
+        // CORS preflight
         if (request.method.toUpperCase() === "OPTIONS") {
             return event.respondWith(handleOptionsRequest(request))
         }
 
-        return event.respondWith(handleNonCachedRequest(request))
+        // Handle GraphQL requests with caching
+        if (url.pathname === '/v1/graphql' && request.method.toUpperCase() === "POST") { //&& request.headers.get('X-Skip-Cache') != '1') {
+            return event.respondWith(handlePostRequest(event).then(r => withCors(r, request)))
+        }
+
+        return event.respondWith(handleNonCachedRequest(request).then(r => withCors(r, request)))
     } catch (e) {
         console.log(e.message)
         return event.respondWith(new Response(JSON.stringify({
