@@ -43,6 +43,20 @@ const ALLOWED_ORIGINS = (globalThis.ALLOWED_ORIGINS
     ? globalThis.ALLOWED_ORIGINS.split(',')
     : []).map(o => o.trim().replace(/\/+$/, '')).filter(Boolean)
 
+// True if `origin` is permitted. An allowlist entry is matched exactly, unless
+// it contains `*`, in which case the `*` matches exactly one DNS label (no dots)
+// — e.g. `https://*.foo.pages.dev` matches `https://abc.foo.pages.dev` but not
+// `https://a.b.foo.pages.dev`.
+function originAllowed(origin) {
+    return ALLOWED_ORIGINS.some(allowed => {
+        if (!allowed.includes('*')) return allowed === origin
+        const re = new RegExp('^' + allowed
+            .replace(/[.+?^${}()|[\]\\]/g, '\\$&') // escape regex metachars
+            .replace(/\*/g, '[^.]+') + '$')        // * = one DNS label, no dots
+        return re.test(origin)
+    })
+}
+
 // The worker is browser-facing and serves PUBLIC data, so callers are not
 // authenticated. Abuse is controlled by: edge rate limiting (Cloudflare),
 // mutation blocking, and a locked-down Hasura role (see generateJWT) — NOT by
@@ -63,7 +77,7 @@ function corsHeaders(request) {
     }
     // Reflect the caller's origin if it is on the allowlist, or if the request
     // carries the local-testing bypass secret.
-    if (origin && (ALLOWED_ORIGINS.includes(origin) || originBypassed(request))) {
+    if (origin && (originAllowed(origin) || originBypassed(request))) {
         headers['Access-Control-Allow-Origin'] = origin
     }
     return headers

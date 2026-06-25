@@ -121,15 +121,9 @@ HASURA_ENDPOINT = "https://your-hasura-api.com/v1/graphql"
 # RSA private key (PKCS#8 PEM) used to sign JWTs for Hasura — required
 wrangler secret put JWT_PRIVATE_KEY < jwt-private-pkcs8.pem
 
-# Pre-shared secret the calling backend must send in X-Worker-Secret — required
-wrangler secret put WORKER_SHARED_SECRET
-
 # Default cache TTL in seconds — optional
 wrangler secret put CACHE_TTL
 ```
-
-> The worker **fails closed**: if `WORKER_SHARED_SECRET` is not set, every
-> request is rejected with `401`.
 
 ### 4. Deploy
 
@@ -149,8 +143,20 @@ npm run deploy:production
 |----------|-------------|---------|
 | `HASURA_ENDPOINT` | Your Hasura GraphQL endpoint | Required |
 | `JWT_PRIVATE_KEY` | RSA private key (PKCS#8 PEM) used to sign JWTs (RS256) | Required |
-| `WORKER_SHARED_SECRET` | Pre-shared secret callers send in `X-Worker-Secret` | Required (fails closed) |
+| `HASURA_ROLE` | Hasura role the worker assumes — **must be locked down to public data only** | `anonymous` |
+| `CORS_ALLOW_ORIGIN` | Frontend origin allowed to call the worker | `*` |
 | `CACHE_TTL` | Default cache TTL in seconds | 300 (5 minutes) |
+
+### Security model
+
+The worker is **browser-facing and serves public, anonymous data**, so callers
+are not authenticated (a secret in frontend code is readable by anyone). The
+real boundary is on the Hasura side — see below. Abuse is mitigated by:
+
+- **Locked-down Hasura role** (`HASURA_ROLE`) — restrict it to exactly the public tables/columns/rows the frontend needs.
+- **Read-only** — mutations are blocked by the worker.
+- **Edge rate limiting** — configure a Cloudflare Rate Limiting rule on the worker route.
+- **(Recommended) Hasura allow-list** — `HASURA_GRAPHQL_ENABLE_ALLOWLIST=true` so only the frontend's known queries can run, preventing arbitrary/expensive queries.
 
 ### Hasura Configuration
 
@@ -160,14 +166,15 @@ Configure Hasura to verify the worker's RS256 JWTs using the matching **public**
 HASURA_GRAPHQL_JWT_SECRET='{"type":"RS256","key":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"}'
 ```
 
-### Calling the worker
+> Create the role named by `HASURA_ROLE` (default `anonymous`) and grant it
+> **select-only** permissions on public data. This role is what every request
+> runs as.
 
-The backend must include the shared secret on every request:
+### Calling the worker
 
 ```bash
 curl https://your-worker.example.com/v1/graphql \
   -H "Content-Type: application/json" \
-  -H "X-Worker-Secret: <WORKER_SHARED_SECRET>" \
   -d '{"query":"{ your_query }"}'
 ```
 

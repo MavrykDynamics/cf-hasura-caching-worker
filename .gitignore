@@ -11,6 +11,11 @@ package-lock.json
 .env.development.local
 .env.test.local
 .env.production.local
+.dev.vars
+
+# Keys / secrets — never commit
+*.pem
+*.key
 
 # Wrangler
 .wrangler/
