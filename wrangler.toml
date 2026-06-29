@@ -12,11 +12,11 @@ name = "hasura-cache-worker-equiteez"
 workers_dev = true
 preview_urls = true
 routes = [
-    { pattern = "api.equiteez.com", zone_name = "equiteez.com", custom_domain = true, enabled = true, previews_enabled = false }
+    { pattern = "basenet.api.equiteez.com", zone_name = "equiteez.com", custom_domain = true, enabled = true, previews_enabled = false }
 ]
 
 [env.equiteez.vars]
-ALLOWED_ORIGINS = "https://*.equiteez-app.pages.dev,https://app.equiteez.com,https://api.mbrwa.equiteez.com,https://sandbox-api.mbrwa.equiteez.com,https://test-api.mbrwa.equiteez.com,https://legacy-api.mbrwa.equiteez.com,https://wallet.mavryk.network,https://atlasnet.wallet.mavryk.network,https://basenet.wallet.mavryk.network,https://services.api.mavryk.network"
+ALLOWED_ORIGINS = "https://*.equiteez-app.pages.dev,https://app.equiteez.com,https://api.mbrwa.equiteez.com,https://sandbox-api.mbrwa.equiteez.com,https://test-api.mbrwa.equiteez.com,https://legacy-api.mbrwa.equiteez.com,https://wallet.mavryk.network,https://atlasnet.wallet.mavryk.network,https://basenet.wallet.mavryk.network,https://services.api.mavryk.network,*-match-orders-proxy.akilawallet.workers.dev"
 
 # Dex environment
 [env.dex]
